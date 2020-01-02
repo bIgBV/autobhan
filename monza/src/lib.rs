@@ -1,12 +1,13 @@
 use std::{
-    mem::{copy_nonoverlapping, MaybeUninit},
+    cell::UnsafeCell,
+    mem::MaybeUninit,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 const BUF_SIZE: usize = 256;
 
-pub struct Slot<T> {
-    value: MaybeUninit<T>,
+struct Slot<T> {
+    value: UnsafeCell<MaybeUninit<T>>,
 }
 
 impl<T> Slot<T>
@@ -15,30 +16,34 @@ where
 {
     pub fn init() -> Self {
         Slot {
-            value: MaybeUninit::zeroed(),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 
     /// Copies the providied value into the slot
     ///
-    ///
-    pub fn write(&mut self, value: &T) {
+    /// Safety: We do not care about the previous contents of this slot, so overwriting the value
+    /// inside is safe.
+    pub fn write(&self, value: T) {
         unsafe {
-            let src_ptr: *const T = value;
-            let dst_ptr: *mut T = self.value.as_mut_ptr();
-
-            copy_nonoverlapping(src_ptr, dst_prt, 1);
+            let val = &mut *self.value.get();
+            val.as_mut_ptr().write(value);
         }
     }
 
     /// Read the value stored in this slot
     ///
-    /// **Safety**: A slot can only be read if it has been previously
+    /// Safety: A slot can only be read if it has been previously
     /// written to. Not holding this invarient is undefined behaviour.
-    pub unsafe fn read(mut self) -> T {
-        let value = self.value.assume_init();
-        self.value = MaybeUninit::zeroed();
-        value
+    pub fn read(&self) -> &T {
+        unsafe {
+            &*self
+                .value
+                .get()
+                .as_ref()
+                .unwrap_or_else(|| panic!("We have a Null pointer in a slot!"))
+                .as_ptr()
+        }
     }
 }
 
@@ -46,16 +51,17 @@ pub struct Buffer<T> {
     buf: Box<[Slot<T>]>,
     head: AtomicUsize,
     tail: AtomicUsize,
+    size: usize,
 }
 
 impl<T> Buffer<T>
 where
     T: Send,
 {
-    pub fn new() -> Self {
+    pub fn new(size: usize) -> Self {
         let mut buf = Vec::new();
 
-        for _i in 0..BUF_SIZE {
+        for _ in 0..=size {
             let slot = Slot::init();
             buf.push(slot);
         }
@@ -64,27 +70,51 @@ where
             buf: buf.into_boxed_slice(),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(1),
+            size,
         }
     }
 
-    pub fn insert(&mut self, value: &T) -> Option<()> {
+    pub fn insert(&self, value: T) -> Option<()> {
+        loop {
+            let head = self.head.load(Ordering::SeqCst);
+            let tail = self.head.load(Ordering::SeqCst);
+
+            let next_idx = head + 1 % self.size;
+
+            if next_idx != tail % BUF_SIZE {
+                if self.head.compare_and_swap(head, next_idx, Ordering::SeqCst) == head {
+                    // Now that the head is updated, we actually fill the slot
+                    self.buf[next_idx].write(value);
+                    return Some(());
+                } else {
+                    continue;
+                }
+            } else {
+                return None;
+            }
+        }
+    }
+
+    pub fn get(&self) -> Option<&T> {
         let head = self.head.load(Ordering::SeqCst);
         let tail = self.head.load(Ordering::SeqCst);
 
-        let next_idx = head + 1 % BUF_SIZE;
-
-        if next_idx < tail % BUF_SIZE {
-            unsafe { self.buf[next_idx].write(value) }
-
-            loop {
-                if self.head.compare_and_swap(head, next_idx, Ordering::SeqCst) == head {
-                    break;
-                }
-            }
-
-            Some(())
+        // If there are no elements in the queue, just return early. `insert` ensures that `head`
+        // and `tail` never equal each other except when the queue is empty.
+        if head == tail {
+            return None;
         }
 
-        None
+        // It's safe to read from the tail as there is at least one element in thq queue.
+        let value = self.buf[tail].read();
+
+        let next_idx = tail + 1 % self.size;
+        self.tail.store(next_idx, Ordering::SeqCst);
+
+        Some(value)
     }
 }
+
+unsafe impl<T> Sync for Buffer<T> {}
+unsafe impl<T> Send for Buffer<T> {}
+
