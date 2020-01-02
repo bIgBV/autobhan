@@ -74,7 +74,7 @@ where
         }
     }
 
-    pub fn insert(&self, value: T) -> Option<()> {
+    pub fn push(&self, value: T) -> Option<()> {
         loop {
             let head = self.head.load(Ordering::SeqCst);
             let tail = self.head.load(Ordering::SeqCst);
@@ -95,26 +95,27 @@ where
         }
     }
 
-    pub fn get(&self) -> Option<&T> {
-        let head = self.head.load(Ordering::SeqCst);
-        let tail = self.head.load(Ordering::SeqCst);
+    pub fn pop(&self) -> Option<&T> {
+        loop {
+            let head = self.head.load(Ordering::SeqCst);
+            let tail = self.head.load(Ordering::SeqCst);
 
-        // If there are no elements in the queue, just return early. `insert` ensures that `head`
-        // and `tail` never equal each other except when the queue is empty.
-        if head == tail {
-            return None;
+            // If there are no elements in the queue, just return early. `insert` ensures that `head`
+            // and `tail` never equal each other except when the queue is empty.
+            if head == tail {
+                return None;
+            }
+
+            // It's safe to read from the tail as there is at least one element in thq queue.
+            let value = self.buf[tail].read();
+
+            let next_idx = tail + 1 % self.size;
+            if self.tail.compare_and_swap(tail, next_idx, Ordering::SeqCst) == tail {
+                return Some(value);
+            }
         }
-
-        // It's safe to read from the tail as there is at least one element in thq queue.
-        let value = self.buf[tail].read();
-
-        let next_idx = tail + 1 % self.size;
-        self.tail.store(next_idx, Ordering::SeqCst);
-
-        Some(value)
     }
 }
 
 unsafe impl<T> Sync for Buffer<T> {}
 unsafe impl<T> Send for Buffer<T> {}
-
