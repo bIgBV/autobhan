@@ -1,11 +1,15 @@
 use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
-    sync::{RwLock, atomic::{AtomicUsize, AtomicBool, Ordering} },
+    ptr,
+    sync::{
+        atomic::{self, AtomicBool, AtomicU32, Ordering},
+        RwLock,
+    },
 };
 
-use tracing::debug;
 use loom::sync::CausalCell;
+use tracing::debug;
 
 const BUF_SIZE: usize = 256;
 
@@ -23,41 +27,38 @@ where
         }
     }
 
-    /// Copies the providied value into the slot
-    ///
-    /// Safety: We do not care about the previous contents of this slot, so overwriting the value
-    /// inside is safe.
-    pub fn write(&self, value: T) {
-        self.value.with_mut(|cell| {
-            unsafe {
-                (*cell).as_mut_ptr().write(value);
-            }
-        });
-    }
+    // Copies the providied value into the slot
+    //
+    // Safety: We do not care about the previous contents of this slot, so overwriting the value
+    // inside is safe.
+    // pub fn write(&self, value: T) {
+    //     self.value.with_mut(|cell| unsafe {
+    //         (*cell).as_mut_ptr().write(value);
+    //     });
+    // }
 
-    /// Read the value stored in this slot
-    ///
-    /// Safety: A slot can only be read if it has been previously
-    /// written to. Not holding this invarient is undefined behaviour.
-    pub fn read(&self) -> &T {
-        self.value.with(|value| {
-            unsafe {
-                &*value.as_ref().unwrap_or_else(|| panic!("We have a Null pointer in a slot!")).as_ptr()
-            }
-        })
-    }
+    // Read the value stored in this slot
+    //
+    // Safety: A slot can only be read if it has been previously
+    // written to. Not holding this invarient is undefined behaviour.
+    // pub unsafe fn read(&self) -> T {
+    //     let cell = self.value.with(|value| ptr::read(value));
+
+    //     cell.assume_init()
+    // }
 }
 
 pub struct Buffer<T> {
     buf: Box<[Slot<T>]>,
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    head: AtomicU32,
+    tail: AtomicU32,
     size: usize,
+    mask: usize,
 }
 
 impl<T> Buffer<T>
 where
-    T: Send,
+    T: Send + Clone,
 {
     pub fn new(size: usize) -> Self {
         let mut buf = Vec::new();
@@ -69,36 +70,43 @@ where
 
         Buffer {
             buf: buf.into_boxed_slice(),
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(1),
+            head: AtomicU32::new(0),
+            tail: AtomicU32::new(0),
             size,
+            mask: size - 1,
         }
     }
 
-    pub fn push(&self, value: T) -> Option<()> {
+    pub fn push(&self, value: T) {
         loop {
             let head = self.head.load(Ordering::SeqCst);
             let tail = self.head.load(Ordering::SeqCst);
 
             debug!(head, tail);
 
-            let next_idx = head + 1 % self.size;
+            if tail.wrapping_sub(head) < self.size as u32 {
+                let idx = tail as usize & self.mask;
 
-            if next_idx != tail % BUF_SIZE {
-                if self.head.compare_and_swap(head, next_idx, Ordering::SeqCst) == head {
-                    // Now that the head is updated, we actually fill the slot
-                    self.buf[next_idx].write(value);
-                    return Some(());
-                } else {
-                    continue;
+                unsafe {
+                    self.buf[idx].value.with_mut(|ptr| {
+                        ptr::write((*ptr).as_mut_ptr(), value.clone());
+                    });
+                };
+
+                let actual =
+                    self.tail
+                        .compare_and_swap(tail, tail.wrapping_add(1), Ordering::SeqCst);
+
+                if actual == tail {
+                    return;
                 }
-            } else {
-                return None;
             }
+
+            atomic::spin_loop_hint();
         }
     }
 
-    pub fn pop(&self) -> Option<&T> {
+    pub fn pop(&self) -> Option<T> {
         loop {
             let head = self.head.load(Ordering::SeqCst);
             let tail = self.head.load(Ordering::SeqCst);
@@ -111,16 +119,25 @@ where
                 return None;
             }
 
+            let idx = head as usize & self.mask;
+
             // It's safe to read from the tail as there is at least one element in thq queue.
-            let value = self.buf[tail].read();
+            let value = unsafe {
+                self.buf[idx].value.with(|ptr| {
+                    ptr::read(ptr)
+                })
+            };
 
-            let next_idx = tail + 1 % self.size;
+            let actual = self
+                .head
+                .compare_and_swap(head, head.wrapping_add(1), Ordering::SeqCst);
 
-            debug!(message = "Next tail", next_idx);
-
-            if self.tail.compare_and_swap(tail, next_idx, Ordering::SeqCst) == tail {
-                return Some(value);
+            if actual == head {
+                return Some(unsafe { value.assume_init() });
             }
+
+            // lost the race, try again
+            atomic::spin_loop_hint()
         }
     }
 }
