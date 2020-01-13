@@ -10,3 +10,5 @@ members = ["monza"]
 
 [dependencies]
 monza = { path = "./monza" }
+tracing-subscriber = "0.2.0-alpha.4"
+tracing = "0.1.11"

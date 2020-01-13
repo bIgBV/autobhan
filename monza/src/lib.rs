@@ -93,11 +93,15 @@ where
                     ptr::write((*ptr).as_mut_ptr(), value.clone())
                 };
 
+                let current = tail;
+
                 let actual =
                     self.tail
                         .compare_and_swap(tail, tail.wrapping_add(1), Ordering::SeqCst);
 
-                if actual == tail {
+                debug!(?self.head, ?self.tail);
+
+                if actual == current {
                     return;
                 }
             }
@@ -109,7 +113,7 @@ where
     pub fn pop(&self) -> Option<T> {
         loop {
             let head = self.head.load(Ordering::SeqCst);
-            let tail = self.head.load(Ordering::SeqCst);
+            let tail = self.tail.load(Ordering::SeqCst);
 
             debug!(message = "popping from queue", head, tail);
 
@@ -130,6 +134,8 @@ where
             let actual = self
                 .head
                 .compare_and_swap(head, head.wrapping_add(1), Ordering::SeqCst);
+
+            debug!(message = "updated", ?self.head, ?self.tail);
 
             if actual == head {
                 return Some(unsafe { value.assume_init() });
